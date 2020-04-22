@@ -35,14 +35,6 @@ ComputationClient* CreateClient() {
   return ComputationClient::Create().release();
 }
 
-XrtComputationClient::Worker ParseWorker(const std::string& worker) {
-  std::vector<std::string> parts = absl::StrSplit(worker, ':');
-  XLA_CHECK(parts.size() == 1 || parts.size() == 2) << worker;
-  return parts.size() == 1
-             ? XrtComputationClient::Worker(parts[0], 0)
-             : XrtComputationClient::Worker(parts[0], std::stoi(parts[1]));
-}
-
 std::string MakeGrpcEndPoint(const std::string& server) {
   return server.compare(0, 7, "grpc://") == 0 ? server
                                               : absl::StrCat("grpc://", server);
@@ -110,7 +102,7 @@ void PopulateLocalDevices(XrtComputationClient::Options* options) {
   std::string local_worker = sys_util::GetEnvString("XRT_LOCAL_WORKER", "");
   XrtComputationClient::Worker worker("", -1);
   if (!local_worker.empty()) {
-    worker = ParseWorker(local_worker);
+    worker = XrtComputationClient::ParseWorker(local_worker);
   }
   auto dev_task_map = BuildDeviceTaskMap(*options);
   std::map<std::string, int> min_ordinals;
@@ -192,7 +184,8 @@ bool ParseMeshConfig(
   XLA_CHECK(!local_worker_env.empty())
       << "In a mesh client setup the XRT_LOCAL_WORKER must be specified";
 
-  XrtComputationClient::Worker local_worker = ParseWorker(local_worker_env);
+  XrtComputationClient::Worker local_worker =
+      XrtComputationClient::ParseWorker(local_worker_env);
 
   TF_LOG(INFO) << "Fetching mesh configuration for worker " << local_worker.name
                << ":" << local_worker.task_no << " from mesh service at "
@@ -223,32 +216,34 @@ bool ParseMeshConfig(
   return true;
 }
 
+bool ParseEnvDevices(XrtComputationClient::Options* options) {
+  std::string device_spec = sys_util::GetEnvString("XRT_DEVICE_MAP", "");
+  std::string workers_spec = sys_util::GetEnvString("XRT_WORKERS", "");
+  if (!device_spec.empty() && !workers_spec.empty()) {
+    for (const auto& device_target : absl::StrSplit(device_spec, '|')) {
+      std::vector<std::string> parts = absl::StrSplit(device_target, ';');
+      XLA_CHECK_EQ(parts.size(), 2) << device_target;
+      options->global_device_map.emplace(parts[0], parts[1]);
+    }
+    for (const auto& name_target : absl::StrSplit(workers_spec, '|')) {
+      std::vector<std::string> parts = absl::StrSplit(name_target, ';');
+      XLA_CHECK_EQ(parts.size(), 2) << name_target;
+      options->workers_map.emplace(XrtComputationClient::ParseWorker(parts[0]),
+                                   MakeGrpcEndPoint(parts[1]));
+    }
+  }
+  return !options->global_device_map.empty();
+}
+
 }  // namespace
 
 std::unique_ptr<ComputationClient> ComputationClient::Create() {
   XrtComputationClient::Options options;
   std::unique_ptr<tensorflow::tpu::TopologyProto> topology_proto;
-  if (!ParseEnvBasedTpuClusterConfig(&options) &&
+  if (!ParseEnvDevices(&options) &&
+      !ParseEnvBasedTpuClusterConfig(&options) &&
       !ParseMeshConfig(&options, &topology_proto)) {
-    std::string device_spec = sys_util::GetEnvString(
-        "XRT_DEVICE_MAP",
-        "TPU:0;/job:tpu_worker/replica:0/task:0/device:TPU:0");
-    for (const auto& device_target : absl::StrSplit(device_spec, '|')) {
-      std::vector<std::string> parts = absl::StrSplit(device_target, ';');
-      XLA_CHECK_EQ(parts.size(), 2) << device_target;
-      if (options.default_device.empty()) {
-        options.default_device = parts[0];
-      }
-      options.global_device_map.emplace(parts[0], parts[1]);
-    }
-    std::string workers_spec = sys_util::GetEnvString(
-        "XRT_WORKERS", "tpu_worker:0;grpc://localhost:51000");
-    for (const auto& name_target : absl::StrSplit(workers_spec, '|')) {
-      std::vector<std::string> parts = absl::StrSplit(name_target, ';');
-      XLA_CHECK_EQ(parts.size(), 2) << name_target;
-      options.workers_map.emplace(ParseWorker(parts[0]),
-                                  MakeGrpcEndPoint(parts[1]));
-    }
+    XLA_ERROR() << "Missing XLA configuration";
   }
   PopulateLocalDevices(&options);
   return std::unique_ptr<ComputationClient>(

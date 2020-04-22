@@ -182,6 +182,8 @@ class XrtComputationClient : public ComputationClient {
 
   std::map<std::string, Metric> GetMetrics() const override;
 
+  static Worker ParseWorker(const std::string& worker);
+
   static std::string GetMultiProcessingDevice();
 
  private:
@@ -306,7 +308,8 @@ class XrtComputationClient : public ComputationClient {
   void InitializeDevices(
       std::unique_ptr<tensorflow::tpu::TopologyProto> topology_proto);
 
-  void CreateMeshService(const tensorflow::tpu::TopologyProto& topology_proto);
+  void CreateMeshService(const std::string& address,
+                         const tensorflow::tpu::TopologyProto* topology_proto);
 
   std::vector<DataPtr> GetComputationResults(
       const tensorflow::Tensor& xrt_result, const Shape& result_shape,

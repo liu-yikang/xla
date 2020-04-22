@@ -10,6 +10,7 @@
 
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "tensorflow/cc/ops/const_op.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/util.h"
@@ -1203,8 +1204,7 @@ tensorflow::tpu::TopologyProto XrtComputationClient::InitializeAndFetchTopology(
 
 void XrtComputationClient::InitializeDevices(
     std::unique_ptr<tensorflow::tpu::TopologyProto> topology_proto) {
-  bool is_master = topology_proto == nullptr;
-  if (is_master) {
+  if (topology_proto == nullptr) {
     std::set<Worker> tpu_workers;
     for (const auto& dev_target : options_.global_device_map) {
       tensorflow::DeviceNameUtils::ParsedName parsed_device =
@@ -1259,22 +1259,30 @@ void XrtComputationClient::InitializeDevices(
 
   // Create the mesh service only if we have more than one worker, or if
   // multi-processing is active.
+  std::string mesh_service_address =
+      sys_util::GetEnvString("XRT_MESH_SERVICE_ADDRESS", "");
   std::string mp_device = GetMultiProcessingDevice();
-  if (is_master && topology_proto != nullptr &&
-      (options_.workers_map.size() > 1 || !mp_device.empty())) {
-    CreateMeshService(*topology_proto);
+  if (!mesh_service_address.empty() && !mp_device.empty()) {
+    std::vector<std::string> parts = absl::StrSplit(mp_device, ':');
+    XLA_CHECK_EQ(parts.size(), 2) << mp_device;
+    if (std::stoi(parts[1]) == 0) {
+      CreateMeshService(mesh_service_address, topology_proto.get());
+    }
   }
 }
 
 void XrtComputationClient::CreateMeshService(
-    const tensorflow::tpu::TopologyProto& topology_proto) {
+    const std::string& address,
+    const tensorflow::tpu::TopologyProto* topology_proto) {
   struct Device {
     std::string local_name;
     std::string global_name;
   };
 
   service::grpc::Config config;
-  config.mutable_proto()->CopyFrom(topology_proto);
+  if (topology_proto != nullptr) {
+    config.mutable_proto()->CopyFrom(*topology_proto);
+  }
 
   std::map<Worker, std::vector<Device>> workers_devices;
   for (const auto& dev_target : options_.global_device_map) {
@@ -1298,11 +1306,9 @@ void XrtComputationClient::CreateMeshService(
   }
   config.set_mesh_size(sys_util::GetEnvInt("XRT_SHARD_WORLD_SIZE", 1));
 
-  std::string mesh_service_address =
-      sys_util::GetEnvString("XRT_MESH_SERVICE_ADDRESS", "localhost:53010");
-  TF_VLOG(1) << "Creating mesh service bound to " << mesh_service_address;
-  mesh_service_ = absl::make_unique<service::MeshService>(mesh_service_address,
-                                                          std::move(config));
+  TF_VLOG(1) << "Creating mesh service bound to " << address;
+  mesh_service_ =
+      absl::make_unique<service::MeshService>(address, std::move(config));
 }
 
 std::vector<ComputationClient::DataPtr>
@@ -1741,21 +1747,34 @@ tensorflow::ConfigProto XrtComputationClient::CreateConfigProto(
   return config;
 }
 
+XrtComputationClient::Worker XrtComputationClient::ParseWorker(
+    const std::string& worker) {
+  std::vector<std::string> parts = absl::StrSplit(worker, ':');
+  XLA_CHECK(parts.size() == 1 || parts.size() == 2) << worker;
+  return parts.size() == 1 ? Worker(parts[0], 0)
+                           : Worker(parts[0], std::stoi(parts[1]));
+}
+
 void XrtComputationClient::MaybeCreateLocalService(
     const XrtComputationClient::Options& options) {
-  static const std::string* const grpc_root =
-      new std::string("grpc://localhost:");
+  static const std::string* const grpc_root = new std::string("grpc://");
+  std::string local_worker = sys_util::GetEnvString("XRT_LOCAL_WORKER", "");
+  XrtComputationClient::Worker worker("", -1);
+  if (!local_worker.empty()) {
+    worker = ParseWorker(local_worker);
+  }
   int task_index = -1;
   std::string job_name;
   std::string cluster_spec;
   for (auto& worker_target : options.workers_map) {
-    if (worker_target.second.compare(0, grpc_root->size(), *grpc_root) == 0 &&
+    if ((worker.task_no < 0 || worker_target.first == worker) &&
+        worker_target.second.compare(0, grpc_root->size(), *grpc_root) == 0 &&
         worker_target.first.name == "localservice") {
       job_name = worker_target.first.name;
       task_index = worker_target.first.task_no;
-      cluster_spec = absl::StrCat(
-          worker_target.first.name,
-          "|localhost:", worker_target.second.substr(grpc_root->size()));
+      cluster_spec =
+          absl::StrCat(worker_target.first.name, "|",
+                       worker_target.second.substr(grpc_root->size()));
     }
   }
   if (!cluster_spec.empty()) {
